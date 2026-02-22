@@ -25,13 +25,23 @@ jobs:
       - name: Audit governance policy
         env:
           GH_TOKEN: ${{ github.token }}
+          GOVERNANCE_AUDIT_TOKEN: ${{ secrets.GOVERNANCE_AUDIT_TOKEN }}
           BOOTSTRAP_MODE: ${{ inputs.bootstrap_mode }}
         shell: bash
         run: |
           set -euo pipefail
           repo="${{ github.repository }}"
           failures=0
+          token_source="github.token"
           bootstrap_mode="$(echo "${BOOTSTRAP_MODE:-false}" | tr '[:upper:]' '[:lower:]')"
+          protection_api_access="false"
+          strict="unknown"
+          conversation_required="unknown"
+
+          if [[ -n "${GOVERNANCE_AUDIT_TOKEN:-}" ]]; then
+            export GH_TOKEN="$GOVERNANCE_AUDIT_TOKEN"
+            token_source="secret:GOVERNANCE_AUDIT_TOKEN"
+          fi
 
           has_issues="$(gh api "repos/$repo" --jq '.has_issues')"
           if [[ "$has_issues" != "true" ]]; then
@@ -39,34 +49,44 @@ jobs:
             failures=$((failures + 1))
           fi
 
-          protection_json="$(gh api "repos/$repo/branches/main/protection")"
-          strict="$(echo "$protection_json" | jq -r '.required_status_checks.strict')"
-          if [[ "$strict" != "true" ]]; then
-            echo "FAIL: main branch strict status checks are not enabled."
-            failures=$((failures + 1))
-          fi
-
-          conversation_required="$(echo "$protection_json" | jq -r '.required_conversation_resolution.enabled')"
-          if [[ "$conversation_required" != "true" ]]; then
-            echo "FAIL: required conversation resolution is not enabled on main."
-            failures=$((failures + 1))
-          fi
-
-          required_checks=(
-            "run-labview-cli"
-            "run-labview-cli-windows"
-            "stabilization-2026-certification-gate"
-          )
-          for check in "${required_checks[@]}"; do
-            if ! echo "$protection_json" | jq -e --arg c "$check" '.required_status_checks.contexts | index($c)' > /dev/null; then
-              if [[ "$bootstrap_mode" == "true" ]]; then
-                echo "WARN: required check missing during bootstrap mode: $check"
-              else
-                echo "FAIL: required check missing from branch protection: $check"
-                failures=$((failures + 1))
-              fi
+          protection_json=""
+          if ! protection_json="$(gh api "repos/$repo/branches/main/protection" 2>protection_err.log)"; then
+            echo "FAIL: unable to read main branch protection via API."
+            cat protection_err.log || true
+            if [[ "$token_source" == "github.token" ]]; then
+              echo "FAIL: configure repository secret GOVERNANCE_AUDIT_TOKEN with admin-level repo access."
             fi
-          done
+            failures=$((failures + 1))
+          else
+            protection_api_access="true"
+            strict="$(echo "$protection_json" | jq -r '.required_status_checks.strict')"
+            if [[ "$strict" != "true" ]]; then
+              echo "FAIL: main branch strict status checks are not enabled."
+              failures=$((failures + 1))
+            fi
+
+            conversation_required="$(echo "$protection_json" | jq -r '.required_conversation_resolution.enabled')"
+            if [[ "$conversation_required" != "true" ]]; then
+              echo "FAIL: required conversation resolution is not enabled on main."
+              failures=$((failures + 1))
+            fi
+
+            required_checks=(
+              "run-labview-cli"
+              "run-labview-cli-windows"
+              "stabilization-2026-certification-gate"
+            )
+            for check in "${required_checks[@]}"; do
+              if ! echo "$protection_json" | jq -e --arg c "$check" '.required_status_checks.contexts | index($c)' > /dev/null; then
+                if [[ "$bootstrap_mode" == "true" ]]; then
+                  echo "WARN: required check missing during bootstrap mode: $check"
+                else
+                  echo "FAIL: required check missing from branch protection: $check"
+                  failures=$((failures + 1))
+                fi
+              fi
+            done
+          fi
 
           required_labels=(
             "stabilization"
@@ -103,6 +123,8 @@ jobs:
             echo ""
             echo "- Repository: \`$repo\`"
             echo "- Bootstrap mode: \`$bootstrap_mode\`"
+            echo "- Token source: \`$token_source\`"
+            echo "- Protection API access: \`$protection_api_access\`"
             echo "- Issues enabled: \`$has_issues\`"
             echo "- Strict checks on main: \`$strict\`"
             echo "- Conversation resolution required: \`$conversation_required\`"
